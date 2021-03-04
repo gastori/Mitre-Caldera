@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import uuid
@@ -248,9 +249,10 @@ class Operation(FirstClassObjectInterface, BaseObject):
 
     async def run(self, services):
         # load objective
-        obj = await services.get('data_svc').locate('objectives', match=dict(id=self.adversary.objective))
+        data_svc = services.get('data_svc')
+        obj = await data_svc.locate('objectives', match=dict(id=self.adversary.objective))
         if obj == []:
-            obj = await services.get('data_svc').locate('objectives', match=dict(name='default'))
+            obj = await data_svc.locate('objectives', match=dict(name='default'))
         self.objective = deepcopy(obj[0])
         try:
             # Operation cedes control to planner
@@ -259,10 +261,20 @@ class Operation(FirstClassObjectInterface, BaseObject):
             while not await self.is_closeable():
                 await asyncio.sleep(10)
             await self.close(services)
+
+            # Automatic event log output
+            file_svc = services.get('file_svc')
+            await self._generate_auto_event_logs(file_svc, data_svc, output=True)
         except Exception as e:
             logging.error(e, exc_info=True)
 
     """ PRIVATE """
+
+    async def _generate_auto_event_logs(self, file_svc, data_svc, output=False):
+        event_logs = await self.event_logs(file_svc, data_svc, output=output)
+        event_logs_dumps = json.dumps(event_logs)
+        r_dir = await file_svc.create_exfil_sub_directory('%s/event_logs' % self.get_config('reports_dir'))
+        await file_svc.save_file('operation_%s' % self.id, event_logs_dumps.encode(), r_dir, encrypt=False)
 
     async def _convert_link_to_event_log(self, link, file_svc, data_svc, output=False):
         event_dict = dict(command=link.command,
