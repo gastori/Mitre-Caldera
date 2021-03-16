@@ -33,6 +33,7 @@ class RestApi(BaseWorld):
         self.app_svc.application.router.add_static('/gui', 'static/', append_version=True)
         # unauthorized GUI endpoints
         self.app_svc.application.router.add_route('*', '/', self.landing)
+        self.app_svc.application.router.add_route('*', '/saml', self.saml)
         self.app_svc.application.router.add_route('*', '/enter', self.validate_login)
         self.app_svc.application.router.add_route('*', '/logout', self.logout)
         self.app_svc.application.router.add_route('GET', '/login', self.login)
@@ -51,6 +52,7 @@ class RestApi(BaseWorld):
         return dict()
 
     async def validate_login(self, request):
+        self.log.debug('Validating login')
         return await self.auth_svc.login_user(request)
 
     @template('login.html')
@@ -58,12 +60,32 @@ class RestApi(BaseWorld):
         await self.auth_svc.logout_user(request)
 
     async def landing(self, request):
+        """If user doesn't have access, server will attempt to redirect to SAML identity provider if SAML
+        is enabled. If SAML isn't enabled, or if an error occurs when attempting to redirect to the identity provider,
+        the user will be sent to the default login page."""
+
         access = await self.auth_svc.get_permissions(request)
         if not access:
+            if self.auth_svc.saml_enabled:
+                await self.auth_svc.saml_redirect(request)
             return render_template('login.html', request, dict())
         plugins = await self.data_svc.locate('plugins', {'access': tuple(access), **dict(enabled=True)})
         data = dict(plugins=[p.display for p in plugins], errors=self.app_svc.errors + self._request_errors(request))
         return render_template('%s.html' % access[0].name, request, data)
+
+    async def saml(self, request):
+        """If SAML is enabled, handle the SAML authentication."""
+
+        if self.auth_svc.saml_enabled:
+            try:
+                await self.auth_svc.saml_login(request)
+            except web.HTTPRedirection as http_redirect:
+                raise http_redirect
+            except Exception as e:
+                self.log.error('Exception when handling /saml request: %s' % e)
+        else:
+            self.log.error('SAML not enabled on server. Returning default login page.')
+        return render_template('login.html', request, dict())
 
     """ API ENDPOINTS """
 

@@ -12,6 +12,8 @@ from cryptography import fernet
 import ldap3
 from ldap3.core.exceptions import LDAPAttributeError, LDAPException
 
+from onelogin.saml2.auth import OneLogin_Saml2_Auth
+
 from app.service.interfaces.i_auth_svc import AuthServiceInterface
 from app.utility.base_service import BaseService
 
@@ -52,6 +54,8 @@ class AuthService(AuthServiceInterface, BaseService):
         self.user_map = dict()
         self.log = self.add_service('auth_svc', self)
         self.ldap_config = self.get_config('ldap')
+        self._saml_config = self.get_config('saml')
+        self.saml_enabled = self.get_config('saml_enabled')
 
     async def apply(self, app, users):
         if users:
@@ -81,21 +85,29 @@ class AuthService(AuthServiceInterface, BaseService):
         :param request:
         :return: the response/location of where the user is trying to navigate
         """
+        self.log.debug('Logging in user')
         data = await request.post()
         username = data.get('username')
         password = data.get('password')
         if self.ldap_config:
             verified = await self._ldap_login(username, password)
+        elif self.saml_enabled and not (username or password):
+            # If login attempt did not contain username or password, and SAML is enabled, then redirect
+            # to identity provider login page.
+            await self.saml_redirect(request)
         else:
             verified = await self._check_credentials(request.app.user_map, username, password)
 
         if verified:
-            self.log.debug('%s logging in:' % username)
-            response = web.HTTPFound('/')
-            await remember(request, response, username)
-            raise response
+            await self.provide_verified_login_response(request, username)
         self.log.debug('%s failed login attempt: ' % username)
         raise web.HTTPFound('/login')
+
+    async def provide_verified_login_response(self, request, username):
+        self.log.debug('%s logging in:' % username)
+        response = web.HTTPFound('/')
+        await remember(request, response, username)
+        raise response
 
     async def check_permissions(self, group, request):
         try:
@@ -104,6 +116,8 @@ class AuthService(AuthServiceInterface, BaseService):
                 return True
             await check_permission(request, group)
         except (HTTPUnauthorized, HTTPForbidden):
+            if self.saml_enabled:
+                await self.saml_redirect(request)
             raise web.HTTPFound('/login')
 
     async def get_permissions(self, request):
@@ -117,7 +131,64 @@ class AuthService(AuthServiceInterface, BaseService):
             return self.Access.BLUE, self.Access.APP
         return ()
 
+    async def saml_login(self, request):
+        saml_response = await self._prepare_auth_parameter(request)
+        saml_auth = OneLogin_Saml2_Auth(saml_response, self._saml_config)
+        saml_auth.process_response()
+        errors = saml_auth.get_errors()
+        if errors:
+            self.log.error('Error when processing SAML response: %s' % ', '.join(errors))
+        else:
+            if saml_auth.is_authenticated():
+                username = self._get_saml_login_username(saml_auth)
+                self.log.debug('SAML provided username: %s' % username)
+                if username:
+                    if username in self.user_map:
+                        await self.provide_verified_login_response(request, username)
+                    else:
+                        self.log.warn('Username %s not configured for login' % username)
+                else:
+                    self.log.error('No NameID or username attribute provided in SAML response.')
+            else:
+                self.log.warn('Not authenticated.')
+
+    async def saml_redirect(self, request):
+        """Will raise web.HTTPFound for identity provider redirect on success."""
+
+        try:
+            saml_request = await self._prepare_auth_parameter(request)
+            auth = OneLogin_Saml2_Auth(saml_request, self._saml_config)
+            redirect = auth.login()
+            raise web.HTTPFound(redirect)
+        except web.HTTPRedirection as http_redirect:
+            raise http_redirect
+        except Exception as e:
+            self.log.error('Error redirecting to SAML identity provider: %s' % e)
+
     """ PRIVATE """
+
+    @staticmethod
+    def _get_saml_login_username(saml_auth):
+        """If the SAML subject NameID is provided, use that as the username. Otherwise, use the 'username'
+        attribute if available."""
+
+        name_id = saml_auth.get_nameid()
+        if name_id:
+            return name_id
+        attributes = saml_auth.get_attributes()
+        username_attr_list = attributes.get('username', [])
+        return username_attr_list[0] if len(username_attr_list) > 0 else None
+
+    @staticmethod
+    async def _prepare_auth_parameter(request):
+        ret_parameters = {
+            'http_host': request.url.host,
+            'script_name': request.url.path,
+            'server_port': request.url.port,
+            'get_data': request.url.query.copy(),
+            'post_data': (await request.post()).copy(),
+        }
+        return ret_parameters
 
     @staticmethod
     async def _check_credentials(user_map, username, password):
